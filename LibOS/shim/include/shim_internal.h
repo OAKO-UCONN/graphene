@@ -4,6 +4,8 @@
 #ifndef _SHIM_INTERNAL_H_
 #define _SHIM_INTERNAL_H_
 
+#include <stdbool.h>
+
 #include "api.h"
 #include "assert.h"
 #include "atomic.h"
@@ -261,10 +263,6 @@ void parse_syscall_after(int sysno, const char* name, int nr, ...);
 
 #define PAL_CB(member) (pal_control.member)
 
-static inline PAL_HANDLE thread_create(void* func, void* arg) {
-    return DkThreadCreate(func, arg);
-}
-
 static inline int64_t __disable_preempt(shim_tcb_t* tcb) {
     // tcb->context.syscall_nr += SYSCALL_NR_PREEMPT_INC;
     int64_t preempt = __atomic_add_fetch(&tcb->context.preempt.counter, 1, __ATOMIC_SEQ_CST);
@@ -435,9 +433,10 @@ void set_rlimit_cur(int resource, uint64_t rlim);
 
 int object_wait_with_retry(PAL_HANDLE handle);
 
-void release_clear_child_tid(int* clear_child_tid);
-
 void _update_epolls(struct shim_handle* handle);
 void delete_from_epoll_handles(struct shim_handle* handle);
+
+void* allocate_stack(size_t size, size_t protect_size, bool user);
+int init_stack(const char** argv, const char** envp, const char*** out_argp, elf_auxv_t** out_auxv);
 
 #endif /* _SHIM_INTERNAL_H_ */

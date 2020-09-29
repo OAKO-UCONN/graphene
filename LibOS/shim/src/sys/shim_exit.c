@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: LGPL-3.0-or-later */
-/* Copyright (C) 2014 Stony Brook University */
-
-/*
- * Implementation of system calls "exit" and "exit_group".
+/* Copyright (C) 2014 Stony Brook University
+ * Copyright (C) 2020 Invisible Things Lab
+ *                    Borys Popławski <borysp@invisiblethingslab.com>
+ * Copyright (C) 2020 Intel Corporation
+ *                    Borys Popławski <borysp@invisiblethingslab.com>
  */
 
 #include "pal.h"
@@ -11,90 +12,10 @@
 #include "shim_internal.h"
 #include "shim_ipc.h"
 #include "shim_lock.h"
+#include "shim_process.h"
 #include "shim_table.h"
 #include "shim_thread.h"
 #include "shim_utils.h"
-
-int thread_destroy(struct shim_thread* thread, bool send_ipc) {
-    bool sent_exit_msg = false;
-
-    /* Chia-Che: Broadcast exit message as early as possible,
-       so other process can start early on responding. */
-    if (thread->in_vm && send_ipc) {
-        ipc_cld_exit_send(thread->ppid, thread->tid, thread->exit_code, thread->term_signal);
-        sent_exit_msg = true;
-    }
-
-    lock(&thread->lock);
-
-    if (!thread->is_alive || is_internal(thread)) {
-        unlock(&thread->lock);
-        return 0;
-    }
-
-    if (!thread->in_vm) {
-        /* We need to mark remote threads as dead manually here. */
-        thread->is_alive = false;
-    }
-
-    int exit_code = thread->exit_code;
-
-    struct shim_handle_map* handle_map = thread->handle_map;
-    struct shim_handle* exec = thread->exec;
-    struct shim_thread* parent = thread->parent;
-    thread->handle_map = NULL;
-    thread->exec       = NULL;
-
-    if (parent) {
-        assert(parent != thread);
-        assert(parent->child_exit_event);
-        debug("thread exits, notifying thread %d\n", parent->tid);
-
-        lock(&parent->lock);
-        LISTP_DEL_INIT(thread, &parent->children, siblings);
-        LISTP_ADD_TAIL(thread, &parent->exited_children, siblings);
-        unlock(&parent->lock);
-
-        if (!thread->in_vm) {
-            debug("deliver SIGCHLD (thread = %d, exitval = %d)\n", thread->tid, exit_code);
-
-            siginfo_t info;
-            memset(&info, 0, sizeof(siginfo_t));
-            info.si_signo  = SIGCHLD;
-            info.si_pid    = thread->tid;
-            info.si_uid    = thread->uid;
-            info.si_status = (exit_code & 0xff) << 8;
-            info.si_code   = (exit_code & 0xff) >= 128 ? CLD_KILLED : CLD_EXITED;
-
-            if (append_signal(parent, &info) >= 0) {
-                thread_wakeup(parent);
-                DkThreadResume(parent->pal_handle);
-            }
-        }
-
-        DkEventSet(parent->child_exit_event);
-    } else if (!sent_exit_msg) {
-        debug("parent not here, need to tell another process\n");
-        ipc_cld_exit_send(thread->ppid, thread->tid, thread->exit_code, thread->term_signal);
-    }
-
-    struct robust_list_head* robust_list = thread->robust_list;
-    thread->robust_list = NULL;
-
-    unlock(&thread->lock);
-
-    if (handle_map)
-        put_handle_map(handle_map);
-
-    if (exec)
-        put_handle(exec);
-
-    if (robust_list)
-        release_robust_list(robust_list);
-
-    DkEventSet(thread->exit_event);
-    return 0;
-}
 
 static noreturn void libos_exit(int error_code, int term_signal) {
     struct shim_thread* async_thread = terminate_async_helper();
@@ -115,18 +36,22 @@ static noreturn void libos_exit(int error_code, int term_signal) {
         put_thread(ipc_thread);
     }
 
+    // TODO: this does not distinguish signal 1 from exit code 1 ...
     shim_clean_and_exit(term_signal ? term_signal : error_code);
 }
 
 noreturn void thread_exit(int error_code, int term_signal) {
+    /* Disable preemption as soon we won't be able to process signals. */
+    disable_preempt(NULL);
+
     struct shim_thread* cur_thread = get_cur_thread();
+    /* Take the reference - ownership will be passed to `cleanup_thread` function or, if this is
+     * the last thread, will make sure that it does not get deleted (not sure if that's needed, but
+     * that's not a problem, since we are exiting the whole process anyway). */
+    get_thread(cur_thread);
 
-    cur_thread->exit_code = -error_code;
-    cur_thread->term_signal = term_signal;
-
-    thread_destroy(cur_thread, true);
-
-    if (!mark_self_dead()) {
+    /* Remove current thread from the threads list. */
+    if (!check_last_thread(/*mark_self_dead=*/true)) {
         /* ask Async Helper thread to cleanup this thread */
         cur_thread->clear_child_tid_pal = 1; /* any non-zero value suffices */
         int64_t ret = install_async_event(NULL, 0, &cleanup_thread, cur_thread);
@@ -141,9 +66,12 @@ noreturn void thread_exit(int error_code, int term_signal) {
         /* UNREACHABLE */
     }
 
-    /* We are exiting the whole process - disable preemption as soon we won't be able to process
-     * signals. */
-    disable_preempt(NULL);
+    /* Let parent know we exited. */
+    int ret = ipc_cld_exit_send(error_code, term_signal);
+    if (ret < 0) {
+        debug("Sending IPC process-exit notification failed: %d\n", ret);
+    }
+
     /* At this point other threads might be still in the middle of an exit routine, but we don't
      * care since the below will call `exit_group` eventually. */
     libos_exit(error_code, term_signal);
@@ -182,7 +110,7 @@ bool kill_other_threads(void) {
     DkThreadYieldExecution();
 
     /* Wait for all other threads to exit. */
-    while (!check_last_thread()) {
+    while (!check_last_thread(/*mark_self_dead=*/false)) {
         /* Tell other threads to exit again - the previous announcement could have been missed by
          * threads that were just being created. */
         if (walk_thread_list(mark_thread_to_die, get_cur_thread(), /*one_shot=*/false) != -ESRCH) {
