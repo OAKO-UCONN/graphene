@@ -1,0 +1,10 @@
+[Unit]
+Description=Prometheus exporter for SGX metrics
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 -m graphenelibos.sgx_exporter
+User=aesmd
+
+[Install]
+WantedBy=multi-user.target
